@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <title>QuietSeeker - 湘南エリア版</title>
+    <script src="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.js"></script>
+    <link href="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.css" rel="stylesheet" />
+    <style>
+        body { margin: 0; padding: 0; overflow: hidden; }
+        #map { height: 100vh; width: 100%; }
+        .input-panel {
+            position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+            z-index: 100; background: white; padding: 25px; border-radius: 15px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.3); font-family: sans-serif;
+            text-align: center; display: none; width: 320px;
+        }
+        .choice-btn {
+            padding: 12px; border: none; border-radius: 8px; cursor: pointer;
+            background: #0078ff; color: white; font-weight: bold; width: 100%; margin-top: 8px;
+        }
+        .facility-choice { display: none; margin-top: 15px; padding-top: 15px; border-top: 1px solid #eee; }
+        .status-msg {
+            position: absolute; bottom: 30px; left: 50%; transform: translateX(-50%);
+            z-index: 10; background: rgba(0,0,0,0.95); color: #00ff00;
+            padding: 15px 25px; border-radius: 15px; font-family: monospace; font-size: 12px;
+            max-width: 90%; min-width: 300px; line-height: 1.5;
+        }
+        .status-msg a { color: #00ff00; text-decoration: underline; font-weight: bold; }
+        .rank-label { background: #00ff00; color: #000; padding: 2px 6px; border-radius: 4px; font-weight: bold; margin-right: 5px; }
+    </style>
+</head>
+<body>
+
+    <div id="inputPanel" class="input-panel">
+        <div id="setupStep">
+            <b style="font-size: 18px;">🛠️ JFAを用いて静かな地点を探す</b><br>
+            <div style="margin: 15px 0; background: #f5f5f5; padding: 10px; border-radius: 8px;">
+                <label id="rangeLabel" style="font-size: 13px;">解析半径: 1.5km</label><br>
+                <input type="range" id="radiusRange" min="0.5" max="3.0" step="0.5" value="1.5" 
+                       oninput="document.getElementById('rangeLabel').innerText='解析半径: '+this.value+'km'">
+            </div>
+            <button id="execBtn" class="choice-btn" onclick="startJFA()">検索を開始</button>
+        </div>
+
+        <div id="facilityStep" class="facility-choice">
+            <b style="color:#333;">静かなポイント周辺のスポット</b>
+            <div style="display: flex; gap: 8px; margin-top: 10px;">
+                <button class="choice-btn" style="background:#2c3e50;" onclick="searchFacilities('library')">📖 図書館</button>
+                <button class="choice-btn" style="background:#d35400;" onclick="searchFacilities('cafe')">☕ カフェ</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="status" class="status-msg">READY: 地図上をクリックして解析エリアを決定</div>
+    <div id="map"></div>
+
+    <script>
+        const map = new maplibregl.Map({
+            container: 'map',
+            style: 'https://tile.openstreetmap.jp/styles/osm-bright-ja/style.json',
+            center: [139.4470, 35.3368], // 辻堂駅
+            zoom: 14
+        });
+
+        let clickedLngLat = null;
+        let peakLngLat = null;
+        let noiseSeeds = [];
+        let centerMarker = null;
+        let peakMarker = null;
+        let facilityMarkers = [];
+        let isAnalysing = false;
+
+        function getDistanceKm(lat1, lon1, lat2, lon2) {
+            const R = 6371;
+            const dLat = (lat2 - lat1) * Math.PI / 180;
+            const dLon = (lon2 - lon1) * Math.PI / 180;
+            const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
+                      Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+                      Math.sin(dLon/2) * Math.sin(dLon/2);
+            return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+        }
+
+        function resetAll() {
+            if (centerMarker) centerMarker.remove();
+            if (peakMarker) peakMarker.remove();
+            facilityMarkers.forEach(m => m.remove());
+            facilityMarkers = [];
+            if (map.getLayer('jfa-heat')) map.removeLayer('jfa-heat');
+            if (map.getSource('jfa-field')) map.removeSource('jfa-field');
+            if (map.getLayer('radius-layer')) map.removeLayer('radius-layer');
+            if (map.getSource('search-radius')) map.removeSource('search-radius');
+        }
+
+        map.on('click', (e) => {
+            if (isAnalysing) return;
+            resetAll();
+            clickedLngLat = e.lngLat;
+            centerMarker = new maplibregl.Marker({ color: '#ff4444' }).setLngLat(clickedLngLat).addTo(map);
+            centerMarker.getElement().title = "指定した地点";
+
+            document.getElementById('setupStep').style.display = 'block';
+            document.getElementById('facilityStep').style.display = 'none';
+            document.getElementById('inputPanel').style.display = 'block';
+            drawCircle(clickedLngLat, document.getElementById('radiusRange').value);
+        });
+
+        function drawCircle(center, radiusKm) {
+            const points = 64; const coords = [];
+            const dX = radiusKm / (111.32 * Math.cos(center.lat * Math.PI / 180));
+            const dY = radiusKm / 110.574;
+            for (let i = 0; i < points; i++) {
+                const th = (i / points) * (2 * Math.PI);
+                coords.push([center.lng + dX * Math.cos(th), center.lat + dY * Math.sin(th)]);
+            }
+            coords.push(coords[0]);
+            if (map.getLayer('radius-layer')) map.removeLayer('radius-layer');
+            if (map.getSource('search-radius')) map.removeSource('search-radius');
+            map.addSource('search-radius', { type: 'geojson', data: { type: 'Feature', geometry: { type: 'Polygon', coordinates: [coords] }}});
+            map.addLayer({ id: 'radius-layer', type: 'fill', source: 'search-radius', paint: { 'fill-color': '#0078ff', 'fill-opacity': 0.1 }});
+        }
+
+        async function startJFA() {
+            isAnalysing = true;
+            document.getElementById('execBtn').disabled = true;
+            const radiusKm = parseFloat(document.getElementById('radiusRange').value);
+            const statusEl = document.getElementById('status');
+            statusEl.innerText = ">> JFA: 解析中...";
+
+            const latD = radiusKm / 111;
+            const lngD = radiusKm / (111 * Math.cos(clickedLngLat.lat * Math.PI / 180));
+            const query = `[out:json][timeout:25];(node["railway"~"station|subway_entrance"](${clickedLngLat.lat-latD},${clickedLngLat.lng-lngD},${clickedLngLat.lat+latD},${clickedLngLat.lng+lngD});node["highway"="bus_stop"](${clickedLngLat.lat-latD},${clickedLngLat.lng-lngD},${clickedLngLat.lat+latD},${clickedLngLat.lng+lngD}););out skel;`;
+
+            try {
+                const res = await fetch(`https://overpass-api.de/api/interpreter?data=${encodeURIComponent(query)}`);
+                const data = await res.json();
+                noiseSeeds = data.elements.map(el => ({ lon: el.lon, lat: el.lat }));
+                if (noiseSeeds.length === 0) throw new Error("範囲内に騒音源がありません");
+
+                const gridSize = 15;
+                let maxQuietScore = -1;
+                const gridFeatures = [];
+                for (let x = -gridSize; x <= gridSize; x++) {
+                    for (let y = -gridSize; y <= gridSize; y++) {
+                        const tLon = clickedLngLat.lng + (x/gridSize)*lngD;
+                        const tLat = clickedLngLat.lat + (y/gridSize)*latD;
+                        if (getDistanceKm(clickedLngLat.lat, clickedLngLat.lng, tLat, tLon) > radiusKm) continue;
+                        let minDist = Infinity;
+                        noiseSeeds.forEach(s => {
+                            const d = getDistanceKm(tLat, tLon, s.lat, s.lon);
+                            if (d < minDist) minDist = d;
+                        });
+                        gridFeatures.push({ type: 'Feature', geometry: { type: 'Point', coordinates: [tLon, tLat] }, properties: { score: minDist } });
+                        if (minDist > maxQuietScore) { maxQuietScore = minDist; peakLngLat = [tLon, tLat]; }
+                    }
+                }
+
+                map.addSource('jfa-field', { type: 'geojson', data: { type: 'FeatureCollection', features: gridFeatures } });
+                map.addLayer({ id: 'jfa-heat', type: 'circle', source: 'jfa-field', paint: { 'circle-radius': 10, 'circle-color': ['interpolate', ['linear'], ['get', 'score'], 0, 'rgba(255,0,0,0.4)', 0.5, 'rgba(255,255,0,0.2)', 1.0, 'rgba(0,255,0,0.4)'] } });
+                
+                peakMarker = new maplibregl.Marker({ color: '#00ff00' }).setLngLat(peakLngLat).addTo(map);
+                peakMarker.getElement().title = "静かなポイント";
+                
+                // --- ここを修正：指定した地点から「静かなポイント」までの移動距離を表示 ---
+                const distToPeak = getDistanceKm(clickedLngLat.lat, clickedLngLat.lng, peakLngLat[1], peakLngLat[0]);
+                statusEl.innerHTML = `>> 解析完了: 静かなポイントを特定<br>指定した地点から静かなポイントまで ${distToPeak.toFixed(2)}km`;
+                
+                document.getElementById('setupStep').style.display = 'none';
+                document.getElementById('facilityStep').style.display = 'block';
+            } catch (err) { statusEl.innerText = "⚠️ " + err.message; }
+            finally { isAnalysing = false; document.getElementById('execBtn').disabled = false; }
+        }
+
+        async function searchFacilities(type) {
+            const typeLabel = type === 'library' ? '図書館' : 'カフェ';
+            const statusEl = document.getElementById('status');
+            statusEl.innerText = `>> 静かなポイント周辺2kmの${typeLabel}を探索中...`;
+            
+            const d = 0.02; 
+            const query = `[out:json][timeout:25];(nwr["amenity"="${type}"](${peakLngLat[1]-d},${peakLngLat[0]-d},${peakLngLat[1]+d},${peakLngLat[0]+d}););out center;`;
+
+            try {
+                const res = await fetch(`https://overpass-api.de/api/interpreter?data=${encodeURIComponent(query)}`);
+                const data = await res.json();
+                const ranked = data.elements.map(el => {
+                    const lon = el.lon || (el.center ? el.center.lon : null);
+                    const lat = el.lat || (el.center ? el.center.lat : null);
+                    if(!lon) return null;
+                    let minD = Infinity;
+                    noiseSeeds.forEach(s => {
+                        const dist = getDistanceKm(lat, lon, s.lat, s.lon);
+                        if (dist < minD) minD = dist;
+                    });
+                    const distFromStart = getDistanceKm(clickedLngLat.lat, clickedLngLat.lng, lat, lon);
+                    return { name: el.tags.name || "名称不明のスポット", lat, lon, quietScore: minD, distFromStart };
+                }).filter(x => x !== null).sort((a, b) => b.quietScore - a.quietScore).slice(0, 3);
+
+                if (ranked.length === 0) {
+                    statusEl.innerText = `>> 周辺2kmに${typeLabel}は見つかりませんでした。`;
+                    return;
+                }
+
+                document.getElementById('inputPanel').style.display = 'none';
+                let html = `🏆 <b>穴場・${typeLabel} TOP${ranked.length}</b><br>`;
+                ranked.forEach((spot, i) => {
+                    const googleLink = `https://www.google.com/search?q=${encodeURIComponent(spot.name + " " + typeLabel)}`;
+                    html += `<span class="rank-label">#${i+1}</span> <a href="${googleLink}" target="_blank">${spot.name}</a> (指定した地点から${spot.distFromStart.toFixed(2)}km)<br>`;
+                    const m = new maplibregl.Marker({ color: '#f1c40f' }).setLngLat([spot.lon, spot.lat]).setPopup(new maplibregl.Popup().setHTML(`<b>${spot.name}</b>`)).addTo(map);
+                    m.getElement().title = spot.name;
+                    facilityMarkers.push(m);
+                });
+                statusEl.innerHTML = html;
+                map.flyTo({ center: [ranked[0].lon, ranked[0].lat], zoom: 15 });
+            } catch (err) { statusEl.innerText = "⚠️ 施設検索エラー"; }
+        }
+    </script>
+</body>
+</html>
+
+<!-- JFAを使って指定地点から一番静かな場所を探したうえでそこから一番静（交通便が悪い図書館orカフェはそこか探す） -->
